@@ -122,11 +122,12 @@ async function formatAnswer(question, queryResult) {
       role: "system",
       content: `You are a helpful data analyst. Given a user question and raw MongoDB query results, return ONLY a raw JSON object with these fields:
 - "answer_text": one concise sentence directly answering the question with the key number/fact
-- "summary": 2-4 sentences with full context, trends, notable details, and any caveats about the data
+- "summary": 2-4 plain sentences with full context, trends, notable details, and any caveats about the data
+- "markdown": if the data has multiple records or multiple fields that form a table, a GitHub-flavored markdown table string with column-width-aligned separators (e.g. |---------|-------|); otherwise null
 - "assumptions": any assumptions you made about the question or data interpretation (null if none)
 - "confidence": "high" if data directly answers the question, "medium" if partial or approximate, "low" if data is sparse or ambiguous
 
-No markdown. No code fences. Just the raw JSON object.`,
+No code fences. Just the raw JSON object.`,
     },
     {
       role: "user",
@@ -143,7 +144,9 @@ No markdown. No code fences. Just the raw JSON object.`,
     const raw = response.choices[0]?.message?.content?.trim() ?? "";
     const stripped = raw.replace(/^```[a-z]*\n?/, "").replace(/```$/, "").trim();
     try {
-      return JSON.parse(stripped);
+      const parsed = JSON.parse(stripped);
+      if (parsed.markdown) parsed.markdown = normalizeMarkdownTable(parsed.markdown);
+      return parsed;
     } catch {
       return plainFallback(queryResult);
     }
@@ -154,6 +157,24 @@ No markdown. No code fences. Just the raw JSON object.`,
     }
     throw err;
   }
+}
+
+function normalizeMarkdownTable(md) {
+  const lines = md.split("\n").map((l) => l.trim()).filter(Boolean);
+  const isSeparator = (l) => /^\|[\s\-|]+\|$/.test(l);
+
+  // Remove any leading separator rows the LLM put before the header
+  while (lines.length > 0 && isSeparator(lines[0])) lines.shift();
+
+  if (lines.length < 2) return md;
+
+  // Ensure exactly one separator row after the header
+  const header = lines[0];
+  const rest = lines.slice(1).filter((l) => !isSeparator(l));
+  const colCount = (header.match(/\|/g) ?? []).length - 1;
+  const separator = `| ${Array(colCount).fill("---").join(" | ")} |`;
+
+  return [header, separator, ...rest].join("\n");
 }
 
 function formatValue(v) {
@@ -195,20 +216,37 @@ function plainFallback(queryResult) {
         confidence: "medium",
       };
     }
-    // Single doc, multiple fields (including nested arrays/objects from $facet etc.)
-    const lines = entries.map(([k, v]) => `• ${k}: ${formatValue(v)}`).join("\n");
+    // Single doc, multiple fields — summary as plain text, markdown as table
+    const colW0 = Math.max("Field".length, ...entries.map(([k]) => k.length));
+    const colW1 = Math.max("Value".length, ...entries.map(([, v]) => formatValue(v).length));
+    const p = (str, len) => str.padEnd(len);
+    const markdown = [
+      `| ${"Field".padEnd(colW0)} | ${"Value".padEnd(colW1)} |`,
+      `| ${"-".repeat(colW0)} | ${"-".repeat(colW1)} |`,
+      ...entries.map(([k, v]) => `| ${p(k, colW0)} | ${p(formatValue(v), colW1)} |`),
+    ].join("\n");
     const shortAnswer = entries.map(([k, v]) => `${k}: ${formatValue(v)}`).join(" | ");
-    return { answer_text: shortAnswer, summary: lines, assumptions: null, confidence: "medium" };
+    const summary = entries.map(([k, v]) => `${k} is ${formatValue(v)}`).join(". ") + ".";
+    return { answer_text: shortAnswer, summary, markdown, assumptions: null, confidence: "medium" };
   }
 
-  // Multiple records — render as a readable list
-  const lines = queryResult.map((doc, i) => {
-    const parts = Object.entries(doc).map(([k, v]) => `${k}: ${formatValue(v)}`).join(", ");
-    return `${i + 1}. ${parts}`;
-  }).join("\n");
+  // Multiple records — summary as plain text, markdown as table
+  const headers = Object.keys(queryResult[0]);
+  const rows = queryResult.map((doc) => headers.map((h) => formatValue(doc[h])));
+  const colWidths = headers.map((h, i) =>
+    Math.max(h.length, ...rows.map((r) => r[i].length))
+  );
+  const p = (str, len) => str.padEnd(len);
+  const headerRow = `| ${headers.map((h, i) => p(h, colWidths[i])).join(" | ")} |`;
+  const separatorRow = `| ${colWidths.map((w) => "-".repeat(w)).join(" | ")} |`;
+  const dataRows = rows.map((r) =>
+    `| ${r.map((cell, i) => p(cell, colWidths[i])).join(" | ")} |`
+  ).join("\n");
+  const markdown = [headerRow, separatorRow, dataRows].join("\n");
   return {
     answer_text: `${queryResult.length} records returned.`,
-    summary: lines,
+    summary: `Query returned ${queryResult.length} records across ${headers.length} fields: ${headers.join(", ")}.`,
+    markdown,
     assumptions: null,
     confidence: "medium",
   };

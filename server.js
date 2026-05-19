@@ -97,6 +97,7 @@ app.post("/ask", async (req, res) => {
     status: "ok",
     answer_text: formatted.answer_text,
     summary: formatted.summary,
+    ...(formatted.markdown ? { markdown: formatted.markdown } : {}),
     ...(formatted.assumptions ? { assumptions: formatted.assumptions } : {}),
     confidence: formatted.confidence,
     data_source: "db",
