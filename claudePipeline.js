@@ -15,7 +15,7 @@ const FORMAT_MODEL = process.env.OPENROUTER_FORMAT_MODEL || "google/gemma-4-31b-
  * Returns a parsed { collection, query } object.
  * Throws if the model returns unparseable JSON.
  */
-async function generateMongoQuery(question, schemaSummary) {
+async function generateMongoQuery(question, schemaSummary, previousAttempts = []) {
   const systemPrompt = `You are a read-only MongoDB query generator for a gateway service.
 
 STRICT RULE: Only generate read-only queries. You may ONLY use:
@@ -41,11 +41,23 @@ If you use a simple find, use a plain object for "query".
 SCHEMA:
 ${schemaSummary}`;
 
-  const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: question },
-  ];
-  console.log(`[query-gen] model=${QUERY_MODEL}\n${JSON.stringify(messages, null, 2)}`);
+  // Build messages: system + user question + interleaved retry turns
+  const messages = [{ role: "system", content: systemPrompt }];
+
+  for (const { query, error } of previousAttempts) {
+    messages.push({ role: "assistant", content: JSON.stringify(query) });
+    messages.push({
+      role: "user",
+      content: `That query failed with this MongoDB error:\n${error}\n\nPlease fix the query and try again. Return only the corrected JSON object.`,
+    });
+  }
+
+  // First turn or final retry turn
+  if (previousAttempts.length === 0) {
+    messages.push({ role: "user", content: question });
+  }
+
+  console.log(`[query-gen] attempt=${previousAttempts.length + 1} model=${QUERY_MODEL}\n${JSON.stringify(messages, null, 2)}`);
 
   const response = await client.chat.completions.create({
     model: QUERY_MODEL,
@@ -53,8 +65,6 @@ ${schemaSummary}`;
   });
 
   const raw = response.choices[0]?.message?.content?.trim() ?? "";
-
-  // Strip any accidental markdown fences (defensive)
   const stripped = raw.replace(/^```[a-z]*\n?/, "").replace(/```$/, "").trim();
 
   let parsed;

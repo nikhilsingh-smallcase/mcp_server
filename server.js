@@ -33,34 +33,43 @@ app.post("/ask", async (req, res) => {
     return res.status(400).json({ error: 'Body must contain a non-empty "question" string.' });
   }
 
-  let mongoQuery;
-
-  // ── Step 1: Generate MongoDB query via Claude ──────────────────────────────
-  try {
-    mongoQuery = await generateMongoQuery(question.trim(), schemaSummary);
-  } catch (err) {
-    console.error("[/ask] Query generation failed:", err.message, err.raw ?? "");
-    const status = err.statusCode === 400 ? 400 : 500;
-    return res.status(status).json({
-      error: err.message,
-      ...(err.raw ? { raw_response: err.raw } : {}),
-    });
-  }
-
-  const { collection, query } = mongoQuery;
-  console.log(
-    `[/ask] collection="${collection}" query=${JSON.stringify(query)}`
-  );
-
-  // ── Step 2: Execute query against MongoDB ─────────────────────────────────
+  // ── Steps 1+2: Generate query and execute, with up to 3 retries on MongoDB error ──
+  const MAX_RETRIES = 3;
+  const previousAttempts = [];
   let queryResult;
-  try {
-    queryResult = await runQuery(collection, query);
-  } catch (err) {
-    console.error("[/ask] MongoDB execution failed:", err.message);
-    return res.status(500).json({
-      error: `MongoDB query failed: ${err.message}`,
-    });
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    let mongoQuery;
+    try {
+      mongoQuery = await generateMongoQuery(question.trim(), schemaSummary, previousAttempts);
+    } catch (err) {
+      console.warn(`[/ask] Query generation failed (attempt ${attempt}): ${err.message}`);
+      previousAttempts.push({ query: err.raw ?? null, error: `Invalid JSON returned by model: ${err.raw ?? err.message}` });
+
+      if (attempt === MAX_RETRIES) {
+        return res.status(400).json({ error: `Failed to generate a valid query after ${MAX_RETRIES} attempts.` });
+      }
+      console.log(`[/ask] Retrying with error context…`);
+      continue;
+    }
+
+    const { collection, query } = mongoQuery;
+    console.log(`[/ask] attempt=${attempt} collection="${collection}" query=${JSON.stringify(query)}`);
+
+    try {
+      queryResult = await runQuery(collection, query);
+      break; // success — exit retry loop
+    } catch (err) {
+      console.warn(`[/ask] MongoDB execution failed (attempt ${attempt}): ${err.message}`);
+      previousAttempts.push({ query: mongoQuery, error: err.message });
+
+      if (attempt === MAX_RETRIES) {
+        return res.status(500).json({
+          error: `MongoDB query failed after ${MAX_RETRIES} attempts: ${err.message}`,
+        });
+      }
+      console.log(`[/ask] Retrying with error context…`);
+    }
   }
 
   // ── Step 3: Format result as a human-friendly answer via Claude ───────────
