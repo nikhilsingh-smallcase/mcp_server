@@ -21,6 +21,51 @@ const SKIP_FIELDS = new Set([
   "privateKey", "ssrEncryptionKey", "encryptionKey", "decryptionKey",
 ]);
 
+// Collections out of scope for gateway analytics
+const SKIP_COLLECTIONS = new Set([
+  "mfanalytics",
+  "mfholdings",
+  "mfpartnerconfig",
+  "mfusers",
+  "userapplications",
+]);
+
+// Top-level field prefixes to suppress globally — too noisy or irrelevant for analytics queries
+const SKIP_FIELD_PREFIXES = new Set([
+  "featureBlacklist",  // 18 dynamic keys, never queried analytically
+  "config",            // gatewayTransactions operational fields
+  "assetConfig",       // MF-specific transaction fields
+  "postbackContext",   // deep retry internals
+  "partnerContext",    // Mixed type, not queryable
+  "userConsent",       // PII-adjacent, not useful analytically
+]);
+
+// Per-collection field exclusions (exact path or top-level prefix → skips all nested paths)
+// Key = MongoDB collection name. Value = Set of field paths or top-level prefixes to skip.
+const SKIP_FIELDS_BY_COLLECTION = {
+  gateway: new Set([
+    "meta",                       // display/contact metadata, not useful for queries
+    "authorizedDomains",
+    "authorizedDomainExpressions",
+    "downtime",                   // prefix — skips downtime.value, downtime.reason, downtime.date
+  ]),
+  gatewayTransactions: new Set([
+    "funds",
+    "fundsUrl",
+    "sipAction",
+    "imrAction",
+    "postbackStatus",             // prefix — skips postbackStatus.order, .smtOrder, etc.
+    "flags.sipCreatedOrUpdated",
+    "flags.imrCreatedOrUpdated",
+    "flags.sessionExtended",
+    "flags.hideSubscriptionSuccessScreen",
+    "config.orderName",
+    "config.orderLogo",
+    "meta.opener",
+    "meta.subWidgetEncryptedData",
+  ]),
+};
+
 // Max dot-depth to include (e.g. 2 = "postbackStatus.order" but not "postbackContext.lastUpdates.X.retryAfter")
 const MAX_DEPTH = 2;
 
@@ -145,6 +190,8 @@ function loadSchemas(modelsDir) {
           const collectionName =
             candidate.collection?.name || candidate.modelName;
 
+          if (SKIP_COLLECTIONS.has(collectionName.toLowerCase())) break;
+
           // Build fields map from schema.paths (most reliable source)
           const fields = {};
           for (const [pathName, schemaType] of Object.entries(
@@ -184,7 +231,13 @@ function loadSchemas(modelsDir) {
         .filter(([name]) => {
           const topKey = name.split(".")[0];
           if (SKIP_FIELDS.has(topKey)) return false;
+          if (SKIP_FIELD_PREFIXES.has(topKey)) return false;
           if (name.split(".").length > MAX_DEPTH) return false;
+          const collectionSkips = SKIP_FIELDS_BY_COLLECTION[collectionName];
+          if (collectionSkips) {
+            if (collectionSkips.has(topKey)) return false;  // prefix match
+            if (collectionSkips.has(name)) return false;    // exact path match
+          }
           return true;
         })
         .map(([name, type]) => {

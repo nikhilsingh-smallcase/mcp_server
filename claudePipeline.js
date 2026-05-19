@@ -4,6 +4,30 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+function buildDateAnchors() {
+  const now = new Date();
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  const sub = (days) => { const d = new Date(now); d.setUTCDate(d.getUTCDate() - days); return d; };
+
+  const startOfWeek = new Date(now);
+  const dow = startOfWeek.getUTCDay(); // 0=Sun
+  startOfWeek.setUTCDate(startOfWeek.getUTCDate() - (dow === 0 ? 6 : dow - 1));
+
+  const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const startOfYear  = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
+
+  return [
+    `today              → ${fmt(now)}`,
+    `last 7 days start  → ${fmt(sub(7))}`,
+    `last 14 days start → ${fmt(sub(14))}`,
+    `last 30 days start → ${fmt(sub(30))}`,
+    `last 90 days start → ${fmt(sub(90))}`,
+    `this week (Mon)    → ${fmt(startOfWeek)}`,
+    `this month         → ${fmt(startOfMonth)}`,
+    `this year          → ${fmt(startOfYear)}`,
+  ].join("\n");
+}
+
 // Model for query generation (needs strong JSON/reasoning ability)
 const QUERY_MODEL = process.env.OPENAI_QUERY_MODEL || "gpt-4o-mini";
 // Model for answer formatting (simpler task)
@@ -14,36 +38,66 @@ const FORMAT_MODEL = process.env.OPENAI_FORMAT_MODEL || "gpt-4o-mini";
  * Returns a parsed { collection, query } object.
  * Throws if the model returns unparseable JSON.
  */
-async function generateMongoQuery(question, schemaSummary, previousAttempts = []) {
-  const systemPrompt = `You are a read-only MongoDB query generator for a gateway service.
+async function generateMongoQuery(question, schemaSummary, previousAttempts = [], knownValues = {}) {
+  const knownValuesBlock = Object.keys(knownValues).length > 0
+    ? `\nKNOWN VALUES (use these exact strings when matching — do fuzzy/partial matching on user input to pick the closest one):\n` +
+      Object.entries(knownValues)
+        .map(([key, vals]) => `- ${key}: ${vals.map((v) => JSON.stringify(v)).join(", ")}`)
+        .join("\n")
+    : "";
 
-STRICT RULE: Only generate read-only queries. You may ONLY use:
-- find filters (plain objects)
-- aggregation pipelines using $match, $group, $sort, $limit, $skip, $project, $lookup, $unwind, $count, $facet, $addFields, $replaceRoot, $sample, and other read-only stages
+  const systemPrompt = `You are a read-only MongoDB query generator for a gateway analytics service.
 
-NEVER generate insert, update, delete, drop, createCollection, replaceOne, updateOne, bulkWrite, findAndModify, or any other mutating operation. If the question implies a write, respond with { "collection": "", "query": {} } and nothing else.
+SAFETY: Never generate insert, update, delete, drop, createCollection, replaceOne, updateOne, bulkWrite, findAndModify, or any write. If the question implies a write, return { "collection": "", "query": {} } and nothing else.
+
+COLLECTION SEMANTICS (understand before querying):
+- gateway                        : Partner/tenant config. One doc per partner. gateway.name is the unique partner key (lowercase slug, e.g. "smallcase-website"). Use for partner metadata, flags, stats.
+- gatewayTransactions            : User transaction sessions. gateway field = FK → gateway.name. Primary time field: createdAt (when session started); use completedAt only when asked about completion time.
+- gatewayUsers                   : Broker-connected users per partner. gateway field = FK → gateway.name. accountId = ObjectId ref → gatewayAccounts._id.
+- gatewayAccounts                : Broker account records. accountId = ObjectId ref to broker's own user ID (not gatewayUsers._id).
+- gatewayPartnerAnalyticsConfigs : Per-partner analytics event config. partnerId = FK → gateway.name.
+- userApplications               : Broker onboarding applications. Not linked to gateway directly.
+
+FOREIGN KEY JOINS (for $lookup stages):
+- gatewayTransactions → gateway         : localField "gateway",   foreignField "name"
+- gatewayUsers        → gateway         : localField "gateway",   foreignField "name"
+- gatewayUsers        → gatewayAccounts : localField "accountId", foreignField "_id"
+
+QUERY PATTERN (most analytical questions follow this shape):
+1. $match  { gateway: <partnerName>, createdAt: { $gte: ..., $lte: ... } }   ← always filter early
+2. $match  { status: ..., intent: ... }                                        ← add if question implies it
+3. $group / $count / $project                                                  ← aggregate or project
+Use gatewayTransactions for session/funnel/conversion questions. Use gateway for partner-level config or stats questions.
 
 DATE RULES:
-- Always express dates as Extended JSON: { "$date": "2024-01-15T00:00:00Z" }
-- For relative dates like "last 10 days", compute from today. Today is ${new Date().toISOString().slice(0, 10)}.
-- Use $gte/$lte for date ranges, always with { "$date": "..." } values
+- Express all dates as Extended JSON: { "$date": "2024-01-15T00:00:00Z" }
+- Use these pre-computed anchors directly — do NOT recalculate:
+${buildDateAnchors()}
+- For unlisted ranges (e.g. "last 45 days"), subtract exactly N days from today with no off-by-one.
+- Use $gte/$lte for ranges. Always use createdAt for all date range filtering.
+- "COMPLETED" refers to the status value — it is NOT a time reference. Do not use completedAt just because status is COMPLETED.
+- Only use completedAt if the question explicitly says "completed on", "finished by", or "completion date".
 
-DEFENSIVE RULES (documents may have missing/null fields due to schema evolution):
-- Always wrap array fields in $ifNull when using $size: {"$size": {"$ifNull": ["$fieldName", []]}}
-- Always use $ifNull or $cond when arithmetic on nullable Number fields
-- Prefer $match with $expr over $addFields+$match when filtering by computed values
+DEFENSIVE RULES (schema may have missing/null fields from schema evolution):
+- Array fields with $size: use { "$size": { "$ifNull": ["$fieldName", []] } }
+- Nullable numeric arithmetic: wrap in $ifNull or $cond
+- Filtering on computed values: prefer $match with $expr over $addFields + $match
 
-Given the schema below and a natural language question, return ONLY a raw JSON object with exactly two fields:
+KNOWN VALUES RESOLUTION:
+When the user mentions a name (partner, intent, status), resolve it to the closest known value:
+1. Exact match first (case-insensitive).
+2. If no exact match, pick the known value whose slug contains the user's token as a substring (e.g. "smallcase" → "smallcase-website").
+3. If still ambiguous (multiple candidates match), use { "$regex": "<userToken>", "$options": "i" } instead of guessing.
+Never invent a value not present in the KNOWN VALUES list.
+
+OUTPUT FORMAT:
+Return ONLY a raw JSON object with exactly two fields:
 - "collection" (string): the collection to query
-- "query" (object): either a MongoDB aggregation pipeline (array) or a find filter (object)
-
-No explanation. No markdown. No code fences. Just the raw JSON object.
-
-If you use an aggregation pipeline, use an array for "query".
-If you use a simple find, use a plain object for "query".
+- "query": aggregation pipeline (array) or find filter (plain object)
+No explanation. No markdown. No code fences. Just the raw JSON.
 
 SCHEMA:
-${schemaSummary}`;
+${schemaSummary}${knownValuesBlock}`;
 
   // Build messages: system + original question + interleaved retry turns
   const messages = [
@@ -66,6 +120,7 @@ ${schemaSummary}`;
     response = await client.chat.completions.create({
       model: QUERY_MODEL,
       messages,
+      temperature: 0,
     });
   } catch (apiErr) {
     const msg = apiErr?.message ?? "";
