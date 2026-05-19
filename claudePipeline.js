@@ -94,7 +94,8 @@ ${schemaSummary}`;
 }
 
 /**
- * Call 2: Ask the model to format raw MongoDB results into a human-friendly answer.
+ * Call 2: Ask the model to format raw MongoDB results into a structured response object.
+ * Returns { answer_text, summary, assumptions, confidence }
  */
 async function formatAnswer(question, queryResult) {
   const resultText =
@@ -105,8 +106,13 @@ async function formatAnswer(question, queryResult) {
   const messages = [
     {
       role: "system",
-      content:
-        "You are a helpful data analyst. Given a user question and raw MongoDB query results, write a concise 2-3 sentence human-friendly answer. Be specific with numbers and names from the data.",
+      content: `You are a helpful data analyst. Given a user question and raw MongoDB query results, return ONLY a raw JSON object with these fields:
+- "answer_text": one concise sentence directly answering the question with the key number/fact
+- "summary": 2-4 sentences with full context, trends, notable details, and any caveats about the data
+- "assumptions": any assumptions you made about the question or data interpretation (null if none)
+- "confidence": "high" if data directly answers the question, "medium" if partial or approximate, "low" if data is sparse or ambiguous
+
+No markdown. No code fences. Just the raw JSON object.`,
     },
     {
       role: "user",
@@ -120,7 +126,13 @@ async function formatAnswer(question, queryResult) {
       model: FORMAT_MODEL,
       messages,
     });
-    return response.choices[0]?.message?.content?.trim() ?? plainFallback(queryResult);
+    const raw = response.choices[0]?.message?.content?.trim() ?? "";
+    const stripped = raw.replace(/^```[a-z]*\n?/, "").replace(/```$/, "").trim();
+    try {
+      return JSON.parse(stripped);
+    } catch {
+      return plainFallback(queryResult);
+    }
   } catch (err) {
     if (err.status === 429) {
       console.warn("[format-answer] Rate limited — returning raw result");
@@ -131,14 +143,39 @@ async function formatAnswer(question, queryResult) {
 }
 
 function plainFallback(queryResult) {
-  if (!queryResult || queryResult.length === 0) return "No results found.";
-  if (queryResult.length === 1) {
-    const entries = Object.entries(queryResult[0])
-      .map(([k, v]) => `${k}: ${v}`)
-      .join(", ");
-    return `Result: ${entries}`;
+  if (!queryResult || queryResult.length === 0) {
+    return { answer_text: "No results found.", summary: "The query returned no data.", assumptions: null, confidence: "low" };
   }
-  return `Found ${queryResult.length} records:\n${JSON.stringify(queryResult, null, 2)}`;
+
+  // Single document with a single numeric field — most common case (count, sum, etc.)
+  if (queryResult.length === 1) {
+    const entries = Object.entries(queryResult[0]);
+    if (entries.length === 1 && typeof entries[0][1] === "number") {
+      const [key, val] = entries[0];
+      const readable = val.toLocaleString();
+      return {
+        answer_text: `${key}: ${readable}`,
+        summary: `The query returned a ${key} of ${readable}.`,
+        assumptions: null,
+        confidence: "medium",
+      };
+    }
+    // Single doc, multiple fields — render as readable key-value lines
+    const lines = entries.map(([k, v]) => `• ${k}: ${typeof v === "number" ? v.toLocaleString() : v}`).join("\n");
+    return { answer_text: entries.map(([k, v]) => `${k}: ${v}`).join(", "), summary: lines, assumptions: null, confidence: "medium" };
+  }
+
+  // Multiple records — render as a readable list
+  const lines = queryResult.map((doc, i) => {
+    const parts = Object.entries(doc).map(([k, v]) => `${k}: ${typeof v === "number" ? v.toLocaleString() : v}`).join(", ");
+    return `${i + 1}. ${parts}`;
+  }).join("\n");
+  return {
+    answer_text: `${queryResult.length} records returned.`,
+    summary: lines,
+    assumptions: null,
+    confidence: "medium",
+  };
 }
 
 module.exports = { generateMongoQuery, formatAnswer };

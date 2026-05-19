@@ -27,10 +27,22 @@ if (schemas.length === 0) {
 // ── POST /ask ─────────────────────────────────────────────────────────────────
 
 app.post("/ask", async (req, res) => {
+  const startedAt = Date.now();
   const { question } = req.body ?? {};
 
+  const errorResponse = (httpStatus, message) =>
+    res.status(httpStatus).json({
+      status: "error",
+      answer_text: message,
+      summary: message,
+      assumptions: null,
+      confidence: "low",
+      data_source: "db",
+      timeTaken: `${Date.now() - startedAt}ms`,
+    });
+
   if (!question || typeof question !== "string" || !question.trim()) {
-    return res.status(400).json({ error: 'Body must contain a non-empty "question" string.' });
+    return errorResponse(400, 'Body must contain a non-empty "question" string.');
   }
 
   // ── Steps 1+2: Generate query and execute, with up to 3 retries on MongoDB error ──
@@ -47,7 +59,7 @@ app.post("/ask", async (req, res) => {
       previousAttempts.push({ query: err.raw ?? null, error: `Invalid JSON returned by model: ${err.raw ?? err.message}` });
 
       if (attempt === MAX_RETRIES) {
-        return res.status(400).json({ error: `Failed to generate a valid query after ${MAX_RETRIES} attempts.` });
+        return errorResponse(400, `Failed to generate a valid query after ${MAX_RETRIES} attempts.`);
       }
       console.log(`[/ask] Retrying with error context…`);
       continue;
@@ -64,26 +76,30 @@ app.post("/ask", async (req, res) => {
       previousAttempts.push({ query: mongoQuery, error: err.message });
 
       if (attempt === MAX_RETRIES) {
-        return res.status(500).json({
-          error: `MongoDB query failed after ${MAX_RETRIES} attempts: ${err.message}`,
-        });
+        return errorResponse(500, `MongoDB query failed after ${MAX_RETRIES} attempts: ${err.message}`);
       }
       console.log(`[/ask] Retrying with error context…`);
     }
   }
 
   // ── Step 3: Format result as a human-friendly answer via Claude ───────────
-  let answer;
+  let formatted;
   try {
-    answer = await formatAnswer(question.trim(), queryResult);
+    formatted = await formatAnswer(question.trim(), queryResult);
   } catch (err) {
     console.error("[/ask] Answer formatting failed:", err.message);
-    return res.status(500).json({
-      error: `Failed to format answer: ${err.message}`,
-    });
+    return errorResponse(500, `Failed to format answer: ${err.message}`);
   }
 
-  return res.json({ answer });
+  return res.json({
+    status: "ok",
+    answer_text: formatted.answer_text,
+    summary: formatted.summary,
+    ...(formatted.assumptions ? { assumptions: formatted.assumptions } : {}),
+    confidence: formatted.confidence,
+    data_source: "db",
+    timeTaken: `${Date.now() - startedAt}ms`,
+  });
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
