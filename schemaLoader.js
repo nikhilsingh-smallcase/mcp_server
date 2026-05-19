@@ -17,7 +17,8 @@ const TYPE_SHORT = {
 // Fields that contain secrets or are purely internal — never useful in queries
 const SKIP_FIELDS = new Set([
   "secret", "rotatedSecret", "apiSecret", "rotatedApiSecret",
-  "secretRotations",
+  "secretRotations", "clientSecret", "password", "encryptionDecryptionKey",
+  "privateKey", "ssrEncryptionKey", "encryptionKey", "decryptionKey",
 ]);
 
 // Max dot-depth to include (e.g. 2 = "postbackStatus.order" but not "postbackContext.lastUpdates.X.retryAfter")

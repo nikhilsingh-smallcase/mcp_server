@@ -30,19 +30,16 @@ app.post("/ask", async (req, res) => {
   const startedAt = Date.now();
   const { question } = req.body ?? {};
 
-  const errorResponse = (httpStatus, message) =>
+  const errorResponse = (httpStatus, errorCode, errorMessage, queryId = null) =>
     res.status(httpStatus).json({
       status: "error",
-      answer_text: message,
-      summary: message,
-      assumptions: null,
-      confidence: "low",
-      data_source: "db",
-      timeTaken: `${Date.now() - startedAt}ms`,
+      error_code: errorCode,
+      error_message: errorMessage,
+      ...(queryId != null ? { query_id: queryId } : {}),
     });
 
   if (!question || typeof question !== "string" || !question.trim()) {
-    return errorResponse(400, 'Body must contain a non-empty "question" string.');
+    return errorResponse(400, "INVALID_REQUEST", 'Body must contain a non-empty "question" string.');
   }
 
   // ── Steps 1+2: Generate query and execute, with up to 3 retries on MongoDB error ──
@@ -56,10 +53,15 @@ app.post("/ask", async (req, res) => {
       mongoQuery = await generateMongoQuery(question.trim(), schemaSummary, previousAttempts);
     } catch (err) {
       console.warn(`[/ask] Query generation failed (attempt ${attempt}): ${err.message}`);
+
+      if (err.isDailyLimit) {
+        return errorResponse(429, "RATE_LIMIT_DAILY", err.message);
+      }
+
       previousAttempts.push({ query: err.raw ?? null, error: `Invalid JSON returned by model: ${err.raw ?? err.message}` });
 
       if (attempt === MAX_RETRIES) {
-        return errorResponse(400, `Failed to generate a valid query after ${MAX_RETRIES} attempts.`);
+        return errorResponse(400, "QUERY_GENERATION_FAILED", `Failed to generate a valid query after ${MAX_RETRIES} attempts.`);
       }
       console.log(`[/ask] Retrying with error context…`);
       continue;
@@ -76,7 +78,7 @@ app.post("/ask", async (req, res) => {
       previousAttempts.push({ query: mongoQuery, error: err.message });
 
       if (attempt === MAX_RETRIES) {
-        return errorResponse(500, `MongoDB query failed after ${MAX_RETRIES} attempts: ${err.message}`);
+        return errorResponse(500, "QUERY_EXECUTION_FAILED", `MongoDB query failed after ${MAX_RETRIES} attempts: ${err.message}`);
       }
       console.log(`[/ask] Retrying with error context…`);
     }
@@ -88,7 +90,7 @@ app.post("/ask", async (req, res) => {
     formatted = await formatAnswer(question.trim(), queryResult);
   } catch (err) {
     console.error("[/ask] Answer formatting failed:", err.message);
-    return errorResponse(500, `Failed to format answer: ${err.message}`);
+    return errorResponse(500, "FORMAT_FAILED", `Failed to format answer: ${err.message}`);
   }
 
   return res.json({
@@ -98,7 +100,7 @@ app.post("/ask", async (req, res) => {
     ...(formatted.assumptions ? { assumptions: formatted.assumptions } : {}),
     confidence: formatted.confidence,
     data_source: "db",
-    timeTaken: `${Date.now() - startedAt}ms`,
+    took_ms: Date.now() - startedAt,
   });
 });
 

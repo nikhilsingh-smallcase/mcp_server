@@ -51,6 +51,27 @@ async function closeDb() {
 const READ_ONLY_CHECK = /^\s*(insert|update|delete|drop|create|rename|replace)/i;
 
 /**
+ * Recursively convert Extended JSON date nodes { "$date": "..." } to JS Date objects.
+ * The MongoDB Node.js driver does not auto-deserialize EJSON in query objects.
+ */
+function deserializeDates(value) {
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) return value.map(deserializeDates);
+  if (typeof value === "object") {
+    // EJSON date node
+    if (Object.keys(value).length === 1 && value.$date !== undefined) {
+      return new Date(value.$date);
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = deserializeDates(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
  * Execute a query produced by Claude against MongoDB.
  *
  * @param {string} collectionName
@@ -60,6 +81,7 @@ const READ_ONLY_CHECK = /^\s*(insert|update|delete|drop|create|rename|replace)/i
 async function runQuery(collectionName, query) {
   const db = await getDb();
   const collection = db.collection(collectionName);
+  query = deserializeDates(query);
 
   // Safety: reject if query string starts with a mutating keyword
   const queryStr = JSON.stringify(query).toLowerCase();

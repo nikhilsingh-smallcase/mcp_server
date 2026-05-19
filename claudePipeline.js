@@ -1,14 +1,13 @@
 const OpenAI = require("openai");
 
 const client = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1",
-  apiKey: process.env.OPENROUTER_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 // Model for query generation (needs strong JSON/reasoning ability)
-const QUERY_MODEL = process.env.OPENROUTER_QUERY_MODEL || "deepseek/deepseek-v4-flash:free";
-// Model for answer formatting (simpler task, use a different provider to avoid rate limits)
-const FORMAT_MODEL = process.env.OPENROUTER_FORMAT_MODEL || "google/gemma-4-31b-it:free";
+const QUERY_MODEL = process.env.OPENAI_QUERY_MODEL || "gpt-4o-mini";
+// Model for answer formatting (simpler task)
+const FORMAT_MODEL = process.env.OPENAI_FORMAT_MODEL || "gpt-4o-mini";
 
 /**
  * Call 1: Ask the model to produce a MongoDB query (collection + pipeline/find).
@@ -23,6 +22,11 @@ STRICT RULE: Only generate read-only queries. You may ONLY use:
 - aggregation pipelines using $match, $group, $sort, $limit, $skip, $project, $lookup, $unwind, $count, $facet, $addFields, $replaceRoot, $sample, and other read-only stages
 
 NEVER generate insert, update, delete, drop, createCollection, replaceOne, updateOne, bulkWrite, findAndModify, or any other mutating operation. If the question implies a write, respond with { "collection": "", "query": {} } and nothing else.
+
+DATE RULES:
+- Always express dates as Extended JSON: { "$date": "2024-01-15T00:00:00Z" }
+- For relative dates like "last 10 days", compute from today. Today is ${new Date().toISOString().slice(0, 10)}.
+- Use $gte/$lte for date ranges, always with { "$date": "..." } values
 
 DEFENSIVE RULES (documents may have missing/null fields due to schema evolution):
 - Always wrap array fields in $ifNull when using $size: {"$size": {"$ifNull": ["$fieldName", []]}}
@@ -41,8 +45,11 @@ If you use a simple find, use a plain object for "query".
 SCHEMA:
 ${schemaSummary}`;
 
-  // Build messages: system + user question + interleaved retry turns
-  const messages = [{ role: "system", content: systemPrompt }];
+  // Build messages: system + original question + interleaved retry turns
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: question },  // always present so retries stay on-topic
+  ];
 
   for (const { query, error } of previousAttempts) {
     messages.push({ role: "assistant", content: JSON.stringify(query) });
@@ -52,17 +59,24 @@ ${schemaSummary}`;
     });
   }
 
-  // First turn or final retry turn
-  if (previousAttempts.length === 0) {
-    messages.push({ role: "user", content: question });
-  }
-
   console.log(`[query-gen] attempt=${previousAttempts.length + 1} model=${QUERY_MODEL}\n${JSON.stringify(messages, null, 2)}`);
 
-  const response = await client.chat.completions.create({
-    model: QUERY_MODEL,
-    messages,
-  });
+  let response;
+  try {
+    response = await client.chat.completions.create({
+      model: QUERY_MODEL,
+      messages,
+    });
+  } catch (apiErr) {
+    const msg = apiErr?.message ?? "";
+    if (msg.includes("free-models-per-day") || msg.includes("per-day")) {
+      const err = new Error("Daily free model limit exhausted. Add credits to OpenRouter or try again tomorrow.");
+      err.isDailyLimit = true;
+      err.statusCode = 429;
+      throw err;
+    }
+    throw apiErr;
+  }
 
   const raw = response.choices[0]?.message?.content?.trim() ?? "";
   const stripped = raw.replace(/^```[a-z]*\n?/, "").replace(/```$/, "").trim();
@@ -142,6 +156,27 @@ No markdown. No code fences. Just the raw JSON object.`,
   }
 }
 
+function formatValue(v) {
+  if (v === null || v === undefined) return "null";
+  if (typeof v === "number") return v.toLocaleString();
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) {
+    // Array of single-field objects → extract values inline
+    if (v.length === 0) return "(none)";
+    const keys = v[0] != null && typeof v[0] === "object" ? Object.keys(v[0]) : null;
+    if (keys && keys.length === 1) {
+      const key = keys[0];
+      return v.map((item) => formatValue(item[key])).join(", ");
+    }
+    // Array of objects with multiple fields → one per line
+    return v.map((item) => formatValue(item)).join("; ");
+  }
+  if (typeof v === "object") {
+    return Object.entries(v).map(([k, val]) => `${k}: ${formatValue(val)}`).join(", ");
+  }
+  return String(v);
+}
+
 function plainFallback(queryResult) {
   if (!queryResult || queryResult.length === 0) {
     return { answer_text: "No results found.", summary: "The query returned no data.", assumptions: null, confidence: "low" };
@@ -160,14 +195,15 @@ function plainFallback(queryResult) {
         confidence: "medium",
       };
     }
-    // Single doc, multiple fields — render as readable key-value lines
-    const lines = entries.map(([k, v]) => `• ${k}: ${typeof v === "number" ? v.toLocaleString() : v}`).join("\n");
-    return { answer_text: entries.map(([k, v]) => `${k}: ${v}`).join(", "), summary: lines, assumptions: null, confidence: "medium" };
+    // Single doc, multiple fields (including nested arrays/objects from $facet etc.)
+    const lines = entries.map(([k, v]) => `• ${k}: ${formatValue(v)}`).join("\n");
+    const shortAnswer = entries.map(([k, v]) => `${k}: ${formatValue(v)}`).join(" | ");
+    return { answer_text: shortAnswer, summary: lines, assumptions: null, confidence: "medium" };
   }
 
   // Multiple records — render as a readable list
   const lines = queryResult.map((doc, i) => {
-    const parts = Object.entries(doc).map(([k, v]) => `${k}: ${typeof v === "number" ? v.toLocaleString() : v}`).join(", ");
+    const parts = Object.entries(doc).map(([k, v]) => `${k}: ${formatValue(v)}`).join(", ");
     return `${i + 1}. ${parts}`;
   }).join("\n");
   return {
