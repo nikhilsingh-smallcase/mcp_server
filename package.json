@@ -1,0 +1,17 @@
+{
+  "name": "gateway-qa-service",
+  "version": "1.0.0",
+  "description": "Natural language Q&A over gateway MongoDB data using Claude AI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongodb": "^6.8.0",
+    "mongoose": "^8.5.0",
+    "openai": "^6.38.0"
+  }
+}
