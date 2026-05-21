@@ -26,7 +26,6 @@ if (schemas.length === 0) {
 
 const knownCollections = new Set(schemas.map((s) => s.collectionName));
 
-// Key fields to ground the LLM with real DB values (name resolution)
 const DISTINCT_TARGETS = [
   { collection: "gateway", field: "name" },
   { collection: "gatewayTransactions", field: "gateway" },
@@ -83,15 +82,13 @@ app.post("/ask", async (req, res) => {
     const { collection, query } = mongoQuery;
     console.log(`[/ask] attempt=${attempt} collection="${collection}" query=${JSON.stringify(query)}`);
 
-    // Validate before executing — mutates pipeline in-place to inject $limit if missing
     try {
       validateQuery(collection, query, knownCollections);
     } catch (err) {
+      console.warn(`[/ask] Query validation failed (attempt ${attempt}): ${err.message}`);
       if (err.isSecurity) {
-        console.warn(`[/ask] Security violation: ${err.message}`);
         return errorResponse(400, "QUERY_SECURITY_VIOLATION", err.message);
       }
-      console.warn(`[/ask] Query validation failed (attempt ${attempt}): ${err.message}`);
       previousAttempts.push({ query: mongoQuery, error: err.message });
       if (attempt === MAX_RETRIES) {
         return errorResponse(400, "QUERY_VALIDATION_FAILED", `Query validation failed after ${MAX_RETRIES} attempts: ${err.message}`);
@@ -148,7 +145,7 @@ const PORT = process.env.PORT || 3000;
     knownValues = await fetchDistinctValues(DISTINCT_TARGETS);
     console.log("[startup] Loaded known DB values for name resolution");
   } catch (err) {
-    console.warn("[startup] Could not load known DB values — name resolution will be degraded:", err.message);
+    console.warn("[startup] Could not load known DB values:", err.message);
   }
 
   const server = app.listen(PORT, () => {

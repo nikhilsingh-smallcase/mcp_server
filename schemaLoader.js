@@ -21,48 +21,24 @@ const SKIP_FIELDS = new Set([
   "privateKey", "ssrEncryptionKey", "encryptionKey", "decryptionKey",
 ]);
 
-// Collections out of scope for gateway analytics
+// Collections to exclude entirely from LLM context
 const SKIP_COLLECTIONS = new Set([
-  "mfanalytics",
-  "mfholdings",
-  "mfpartnerconfig",
-  "mfusers",
-  "userapplications",
+  "mfanalytics", "mfholdings", "mfpartnerconfig", "mfusers", "userapplications",
 ]);
 
-// Top-level field prefixes to suppress globally — too noisy or irrelevant for analytics queries
+// Field top-level prefixes to exclude globally across all collections
 const SKIP_FIELD_PREFIXES = new Set([
-  "featureBlacklist",  // 18 dynamic keys, never queried analytically
-  "config",            // gatewayTransactions operational fields
-  "assetConfig",       // MF-specific transaction fields
-  "postbackContext",   // deep retry internals
-  "partnerContext",    // Mixed type, not queryable
-  "userConsent",       // PII-adjacent, not useful analytically
+  "featureBlacklist", "config", "assetConfig", "postbackContext", "partnerContext", "userConsent",
 ]);
 
-// Per-collection field exclusions (exact path or top-level prefix → skips all nested paths)
-// Key = MongoDB collection name. Value = Set of field paths or top-level prefixes to skip.
+// Per-collection exact field paths to exclude
 const SKIP_FIELDS_BY_COLLECTION = {
-  gateway: new Set([
-    "meta",                       // display/contact metadata, not useful for queries
-    "authorizedDomains",
-    "authorizedDomainExpressions",
-    "downtime",                   // prefix — skips downtime.value, downtime.reason, downtime.date
-  ]),
+  gateway: new Set(["meta", "authorizedDomains", "authorizedDomainExpressions", "downtime"]),
   gatewayTransactions: new Set([
-    "funds",
-    "fundsUrl",
-    "sipAction",
-    "imrAction",
-    "postbackStatus",             // prefix — skips postbackStatus.order, .smtOrder, etc.
-    "flags.sipCreatedOrUpdated",
-    "flags.imrCreatedOrUpdated",
-    "flags.sessionExtended",
-    "flags.hideSubscriptionSuccessScreen",
-    "config.orderName",
-    "config.orderLogo",
-    "meta.opener",
-    "meta.subWidgetEncryptedData",
+    "funds", "fundsUrl", "sipAction", "imrAction", "postbackStatus",
+    "flags.sipCreatedOrUpdated", "flags.imrCreatedOrUpdated", "flags.sessionExtended",
+    "flags.hideSubscriptionSuccessScreen", "config.orderName", "config.orderLogo",
+    "meta.opener", "meta.subWidgetEncryptedData",
   ]),
 };
 
@@ -233,11 +209,9 @@ function loadSchemas(modelsDir) {
           if (SKIP_FIELDS.has(topKey)) return false;
           if (SKIP_FIELD_PREFIXES.has(topKey)) return false;
           if (name.split(".").length > MAX_DEPTH) return false;
+          if (SKIP_FIELD_PREFIXES.has(topKey)) return false;
           const collectionSkips = SKIP_FIELDS_BY_COLLECTION[collectionName];
-          if (collectionSkips) {
-            if (collectionSkips.has(topKey)) return false;  // prefix match
-            if (collectionSkips.has(name)) return false;    // exact path match
-          }
+          if (collectionSkips && (collectionSkips.has(topKey) || collectionSkips.has(name))) return false;
           return true;
         })
         .map(([name, type]) => {

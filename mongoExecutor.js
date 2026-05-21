@@ -48,7 +48,6 @@ async function closeDb() {
   }
 }
 
-// Aggregation stages that are safe to execute (read-only)
 const ALLOWED_PIPELINE_STAGES = new Set([
   "$match", "$group", "$sort", "$limit", "$skip", "$project",
   "$lookup", "$unwind", "$count", "$facet", "$addFields",
@@ -56,81 +55,63 @@ const ALLOWED_PIPELINE_STAGES = new Set([
   "$sortByCount", "$bucket", "$bucketAuto", "$unionWith",
 ]);
 
-// Operators that execute arbitrary JS or write data — hard block, no retry
 const DANGEROUS_OPERATORS = new Set([
   "$where", "$function", "$accumulator", "$out", "$merge",
 ]);
 
-function findDangerousOperators(value, found = []) {
-  if (value === null || value === undefined) return found;
+function findDangerousOperators(value, path = "") {
+  if (value === null || typeof value !== "object") return null;
   if (Array.isArray(value)) {
-    for (const item of value) findDangerousOperators(item, found);
-  } else if (typeof value === "object") {
-    for (const [k, v] of Object.entries(value)) {
-      if (DANGEROUS_OPERATORS.has(k)) found.push(k);
-      findDangerousOperators(v, found);
+    for (let i = 0; i < value.length; i++) {
+      const hit = findDangerousOperators(value[i], `${path}[${i}]`);
+      if (hit) return hit;
     }
+    return null;
   }
-  return found;
+  for (const [k, v] of Object.entries(value)) {
+    if (DANGEROUS_OPERATORS.has(k)) return `${path}.${k}`;
+    const hit = findDangerousOperators(v, `${path}.${k}`);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 /**
- * Validate a LLM-generated query before executing it.
- * Throws with err.isSecurity=true for hard blocks (no retry).
- * Throws with err.isRetryable=true for fixable issues (feed back to LLM).
- * Mutates pipeline array in-place to inject $limit if missing.
- *
- * @param {string} collectionName
- * @param {Array|Object} query
- * @param {Set<string>} knownCollections - collection names loaded from schemas
+ * Validate a query before execution.
+ * Throws with err.isSecurity=true for hard blocks, plain Error for soft issues.
  */
 function validateQuery(collectionName, query, knownCollections) {
-  // 1. Collection must be in the known allowlist
+  // 1. Collection must be in the known set
   if (knownCollections && !knownCollections.has(collectionName)) {
-    const err = new Error(
-      `Unknown collection "${collectionName}". Valid collections: ${[...knownCollections].join(", ")}`
-    );
-    err.isRetryable = true;
-    throw err;
-  }
-
-  // 2. Query must be an array (pipeline) or plain object (find filter)
-  if (!Array.isArray(query) && (typeof query !== "object" || query === null)) {
-    const err = new Error(
-      `Query must be an array (pipeline) or plain object (find filter), got ${typeof query}`
-    );
-    err.isRetryable = true;
-    throw err;
-  }
-
-  // 3. Dangerous operators — hard fail, no retry
-  const dangerous = findDangerousOperators(query);
-  if (dangerous.length > 0) {
-    const err = new Error(
-      `Query contains forbidden operator(s): ${dangerous.join(", ")}. These operators are not permitted.`
-    );
+    const err = new Error(`Unknown collection: "${collectionName}"`);
     err.isSecurity = true;
     throw err;
   }
 
-  // 4. Aggregation pipeline: validate stage names + inject $limit if missing
+  // 2. Block dangerous operators anywhere in the query
+  const hit = findDangerousOperators(query);
+  if (hit) {
+    const err = new Error(`Dangerous operator found at ${hit}`);
+    err.isSecurity = true;
+    throw err;
+  }
+
+  // 3. For aggregation pipelines, validate stage names and inject $limit
   if (Array.isArray(query)) {
     for (const stage of query) {
-      if (typeof stage !== "object" || stage === null) continue;
-      for (const key of Object.keys(stage)) {
-        if (key.startsWith("$") && !ALLOWED_PIPELINE_STAGES.has(key)) {
-          const err = new Error(
-            `Pipeline contains disallowed stage "${key}". Allowed stages: ${[...ALLOWED_PIPELINE_STAGES].join(", ")}`
-          );
-          err.isRetryable = true;
-          throw err;
-        }
+      const keys = Object.keys(stage);
+      if (keys.length !== 1) continue;
+      const stageName = keys[0];
+      if (!ALLOWED_PIPELINE_STAGES.has(stageName)) {
+        const err = new Error(`Pipeline stage "${stageName}" is not allowed`);
+        err.isSecurity = true;
+        throw err;
       }
     }
-
-    // Auto-inject $limit if the pipeline has none (silent fix, no retry)
-    const hasLimit = query.some((stage) => "$limit" in stage);
-    if (!hasLimit) {
+    // Auto-inject $limit if no $count and no $limit already present
+    const hasCount = query.some((s) => s.$count !== undefined);
+    const hasLimit = query.some((s) => s.$limit !== undefined);
+    if (!hasCount && !hasLimit) {
       query.push({ $limit: 100 });
     }
   }
@@ -172,10 +153,8 @@ async function runQuery(collectionName, query) {
   let results;
 
   if (Array.isArray(query)) {
-    // Aggregation pipeline
     results = await collection.aggregate(query).toArray();
   } else if (query && typeof query === "object") {
-    // Simple find with a filter object
     results = await collection.find(query).limit(100).toArray();
   } else {
     throw new Error(`Unsupported query type: ${typeof query}`);
@@ -185,11 +164,8 @@ async function runQuery(collectionName, query) {
 }
 
 /**
- * Fetch distinct values for key lookup fields across collections.
- * Used to ground the LLM prompt with real DB values.
- *
- * @param {Array<{collection: string, field: string}>} targets
- * @returns {Object} map of "collection.field" -> distinct values array
+ * Fetch distinct values for a list of { collection, field } targets.
+ * Returns an object keyed by "collection.field".
  */
 async function fetchDistinctValues(targets) {
   const db = await getDb();
@@ -197,14 +173,16 @@ async function fetchDistinctValues(targets) {
   await Promise.all(
     targets.map(async ({ collection, field }) => {
       try {
-        const values = await db.collection(collection).distinct(field);
-        result[`${collection}.${field}`] = values.filter(Boolean).slice(0, 200);
-      } catch (err) {
-        console.warn(`[mongo] Could not fetch distinct ${collection}.${field}: ${err.message}`);
+        const vals = await db.collection(collection).distinct(field);
+        result[`${collection}.${field}`] = vals.filter(
+          (v) => v !== null && v !== undefined && v !== ""
+        );
+      } catch {
+        // Non-fatal: collection may not exist yet
       }
     })
   );
   return result;
 }
 
-module.exports = { runQuery, closeDb, fetchDistinctValues, validateQuery };
+module.exports = { runQuery, closeDb, validateQuery, fetchDistinctValues };
