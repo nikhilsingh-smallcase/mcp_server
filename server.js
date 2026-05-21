@@ -4,7 +4,7 @@ const express = require("express");
 const path = require("path");
 const { loadSchemas } = require("./schemaLoader");
 const { generateMongoQuery, formatAnswer } = require("./claudePipeline");
-const { runQuery, closeDb } = require("./mongoExecutor");
+const { runQuery, closeDb, fetchDistinctValues, validateQuery } = require("./mongoExecutor");
 
 const app = express();
 app.use(express.json());
@@ -23,6 +23,18 @@ if (schemas.length === 0) {
     `[startup] Loaded ${schemas.length} model(s):\n${schemaSummary}\n`
   );
 }
+
+const knownCollections = new Set(schemas.map((s) => s.collectionName));
+
+const DISTINCT_TARGETS = [
+  { collection: "gateway", field: "name" },
+  { collection: "gatewayTransactions", field: "gateway" },
+  { collection: "gatewayTransactions", field: "intent" },
+  { collection: "gatewayTransactions", field: "status" },
+  { collection: "gatewayUsers", field: "gateway" },
+];
+
+let knownValues = {};
 
 // ── POST /ask ─────────────────────────────────────────────────────────────────
 
@@ -50,7 +62,7 @@ app.post("/ask", async (req, res) => {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let mongoQuery;
     try {
-      mongoQuery = await generateMongoQuery(question.trim(), schemaSummary, previousAttempts);
+      mongoQuery = await generateMongoQuery(question.trim(), schemaSummary, previousAttempts, knownValues);
     } catch (err) {
       console.warn(`[/ask] Query generation failed (attempt ${attempt}): ${err.message}`);
 
@@ -69,6 +81,21 @@ app.post("/ask", async (req, res) => {
 
     const { collection, query } = mongoQuery;
     console.log(`[/ask] attempt=${attempt} collection="${collection}" query=${JSON.stringify(query)}`);
+
+    try {
+      validateQuery(collection, query, knownCollections);
+    } catch (err) {
+      console.warn(`[/ask] Query validation failed (attempt ${attempt}): ${err.message}`);
+      if (err.isSecurity) {
+        return errorResponse(400, "QUERY_SECURITY_VIOLATION", err.message);
+      }
+      previousAttempts.push({ query: mongoQuery, error: err.message });
+      if (attempt === MAX_RETRIES) {
+        return errorResponse(400, "QUERY_VALIDATION_FAILED", `Query validation failed after ${MAX_RETRIES} attempts: ${err.message}`);
+      }
+      console.log(`[/ask] Retrying with error context…`);
+      continue;
+    }
 
     try {
       queryResult = await runQuery(collection, query);
@@ -112,18 +139,27 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-  console.log(`[server] Listening on http://localhost:${PORT}`);
-});
 
-// Graceful shutdown
-const shutdown = async (signal) => {
-  console.log(`\n[server] ${signal} received. Shutting down…`);
-  server.close(async () => {
-    await closeDb();
-    process.exit(0);
+(async () => {
+  try {
+    knownValues = await fetchDistinctValues(DISTINCT_TARGETS);
+    console.log("[startup] Loaded known DB values for name resolution");
+  } catch (err) {
+    console.warn("[startup] Could not load known DB values:", err.message);
+  }
+
+  const server = app.listen(PORT, () => {
+    console.log(`[server] Listening on http://localhost:${PORT}`);
   });
-};
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+  const shutdown = async (signal) => {
+    console.log(`\n[server] ${signal} received. Shutting down…`);
+    server.close(async () => {
+      await closeDb();
+      process.exit(0);
+    });
+  };
+
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+})();

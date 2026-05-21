@@ -48,7 +48,74 @@ async function closeDb() {
   }
 }
 
-const READ_ONLY_CHECK = /^\s*(insert|update|delete|drop|create|rename|replace)/i;
+const ALLOWED_PIPELINE_STAGES = new Set([
+  "$match", "$group", "$sort", "$limit", "$skip", "$project",
+  "$lookup", "$unwind", "$count", "$facet", "$addFields",
+  "$replaceRoot", "$sample", "$set", "$replaceWith",
+  "$sortByCount", "$bucket", "$bucketAuto", "$unionWith",
+]);
+
+const DANGEROUS_OPERATORS = new Set([
+  "$where", "$function", "$accumulator", "$out", "$merge",
+]);
+
+function findDangerousOperators(value, path = "") {
+  if (value === null || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const hit = findDangerousOperators(value[i], `${path}[${i}]`);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  for (const [k, v] of Object.entries(value)) {
+    if (DANGEROUS_OPERATORS.has(k)) return `${path}.${k}`;
+    const hit = findDangerousOperators(v, `${path}.${k}`);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Validate a query before execution.
+ * Throws with err.isSecurity=true for hard blocks, plain Error for soft issues.
+ */
+function validateQuery(collectionName, query, knownCollections) {
+  // 1. Collection must be in the known set
+  if (knownCollections && !knownCollections.has(collectionName)) {
+    const err = new Error(`Unknown collection: "${collectionName}"`);
+    err.isSecurity = true;
+    throw err;
+  }
+
+  // 2. Block dangerous operators anywhere in the query
+  const hit = findDangerousOperators(query);
+  if (hit) {
+    const err = new Error(`Dangerous operator found at ${hit}`);
+    err.isSecurity = true;
+    throw err;
+  }
+
+  // 3. For aggregation pipelines, validate stage names and inject $limit
+  if (Array.isArray(query)) {
+    for (const stage of query) {
+      const keys = Object.keys(stage);
+      if (keys.length !== 1) continue;
+      const stageName = keys[0];
+      if (!ALLOWED_PIPELINE_STAGES.has(stageName)) {
+        const err = new Error(`Pipeline stage "${stageName}" is not allowed`);
+        err.isSecurity = true;
+        throw err;
+      }
+    }
+    // Auto-inject $limit if no $count and no $limit already present
+    const hasCount = query.some((s) => s.$count !== undefined);
+    const hasLimit = query.some((s) => s.$limit !== undefined);
+    if (!hasCount && !hasLimit) {
+      query.push({ $limit: 100 });
+    }
+  }
+}
 
 /**
  * Recursively convert Extended JSON date nodes { "$date": "..." } to JS Date objects.
@@ -83,19 +150,11 @@ async function runQuery(collectionName, query) {
   const collection = db.collection(collectionName);
   query = deserializeDates(query);
 
-  // Safety: reject if query string starts with a mutating keyword
-  const queryStr = JSON.stringify(query).toLowerCase();
-  if (READ_ONLY_CHECK.test(queryStr)) {
-    throw new Error("Refusing to execute a potentially mutating query");
-  }
-
   let results;
 
   if (Array.isArray(query)) {
-    // Aggregation pipeline
     results = await collection.aggregate(query).toArray();
   } else if (query && typeof query === "object") {
-    // Simple find with a filter object
     results = await collection.find(query).limit(100).toArray();
   } else {
     throw new Error(`Unsupported query type: ${typeof query}`);
@@ -104,4 +163,26 @@ async function runQuery(collectionName, query) {
   return results;
 }
 
-module.exports = { runQuery, closeDb };
+/**
+ * Fetch distinct values for a list of { collection, field } targets.
+ * Returns an object keyed by "collection.field".
+ */
+async function fetchDistinctValues(targets) {
+  const db = await getDb();
+  const result = {};
+  await Promise.all(
+    targets.map(async ({ collection, field }) => {
+      try {
+        const vals = await db.collection(collection).distinct(field);
+        result[`${collection}.${field}`] = vals.filter(
+          (v) => v !== null && v !== undefined && v !== ""
+        );
+      } catch {
+        // Non-fatal: collection may not exist yet
+      }
+    })
+  );
+  return result;
+}
+
+module.exports = { runQuery, closeDb, validateQuery, fetchDistinctValues };

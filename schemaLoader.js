@@ -21,6 +21,27 @@ const SKIP_FIELDS = new Set([
   "privateKey", "ssrEncryptionKey", "encryptionKey", "decryptionKey",
 ]);
 
+// Collections to exclude entirely from LLM context
+const SKIP_COLLECTIONS = new Set([
+  "mfanalytics", "mfholdings", "mfpartnerconfig", "mfusers", "userapplications",
+]);
+
+// Field top-level prefixes to exclude globally across all collections
+const SKIP_FIELD_PREFIXES = new Set([
+  "featureBlacklist", "config", "assetConfig", "postbackContext", "partnerContext", "userConsent",
+]);
+
+// Per-collection exact field paths to exclude
+const SKIP_FIELDS_BY_COLLECTION = {
+  gateway: new Set(["meta", "authorizedDomains", "authorizedDomainExpressions", "downtime"]),
+  gatewayTransactions: new Set([
+    "funds", "fundsUrl", "sipAction", "imrAction", "postbackStatus",
+    "flags.sipCreatedOrUpdated", "flags.imrCreatedOrUpdated", "flags.sessionExtended",
+    "flags.hideSubscriptionSuccessScreen", "config.orderName", "config.orderLogo",
+    "meta.opener", "meta.subWidgetEncryptedData",
+  ]),
+};
+
 // Max dot-depth to include (e.g. 2 = "postbackStatus.order" but not "postbackContext.lastUpdates.X.retryAfter")
 const MAX_DEPTH = 2;
 
@@ -145,6 +166,8 @@ function loadSchemas(modelsDir) {
           const collectionName =
             candidate.collection?.name || candidate.modelName;
 
+          if (SKIP_COLLECTIONS.has(collectionName.toLowerCase())) break;
+
           // Build fields map from schema.paths (most reliable source)
           const fields = {};
           for (const [pathName, schemaType] of Object.entries(
@@ -185,6 +208,9 @@ function loadSchemas(modelsDir) {
           const topKey = name.split(".")[0];
           if (SKIP_FIELDS.has(topKey)) return false;
           if (name.split(".").length > MAX_DEPTH) return false;
+          if (SKIP_FIELD_PREFIXES.has(topKey)) return false;
+          const collectionSkips = SKIP_FIELDS_BY_COLLECTION[collectionName];
+          if (collectionSkips && (collectionSkips.has(topKey) || collectionSkips.has(name))) return false;
           return true;
         })
         .map(([name, type]) => {
